@@ -1,7 +1,7 @@
-"""Tester: runs the repository's test suite in the workspace and parses it.
+"""Test runner tool: executes the repository's test suite and parses it.
 
-Deterministic on purpose: the verdict on whether a patch works comes from
-actually executing tests, not from a model's opinion.
+Deterministic on purpose: whether a change works is decided by running tests,
+not by a model's opinion. Implements `interfaces.TestRunner`.
 """
 
 from __future__ import annotations
@@ -14,14 +14,14 @@ import sys
 import time
 from pathlib import Path
 
-from patchwork.models.schemas import TestResult
+from patchwork.models.schemas import TestRun
 
 _COUNT = re.compile(r"(\d+) (passed|failed|errors?|skipped)")
 _FAILED_ID = re.compile(r"^(?:FAILED|ERROR) (\S+)", re.MULTILINE)
 
 
-class TesterAgent:
-    __test__ = False  # not a pytest test class
+class PytestRunner:
+    __test__ = False
 
     role = "tester"
 
@@ -29,7 +29,7 @@ class TesterAgent:
         self.command = command or f"{shlex.quote(sys.executable)} -m pytest -q -rfE -p no:cacheprovider"
         self.timeout_s = timeout_s
 
-    def run(self, cwd: Path) -> TestResult:
+    def run(self, cwd: Path) -> TestRun:
         start = time.monotonic()
         try:
             proc = subprocess.run(
@@ -50,7 +50,7 @@ class TesterAgent:
         return parse_pytest(self.command, exit_code, output, time.monotonic() - start)
 
 
-def parse_pytest(command: str, exit_code: int, output: str, duration_s: float = 0.0) -> TestResult:
+def parse_pytest(command: str, exit_code: int, output: str, duration_s: float = 0.0) -> TestRun:
     counts = {"passed": 0, "failed": 0, "errors": 0, "skipped": 0}
     # The summary line is last; scan from the bottom so stray matches above don't win.
     for line in reversed(output.splitlines()):
@@ -63,7 +63,7 @@ def parse_pytest(command: str, exit_code: int, output: str, duration_s: float = 
     # pytest exits 5 when nothing was collected; treat that as a failure to test.
     if exit_code not in (0, 1) and not any(counts.values()):
         counts["errors"] = 1
-    return TestResult(
+    return TestRun(
         command=command,
         exit_code=exit_code,
         duration_s=round(duration_s, 3),

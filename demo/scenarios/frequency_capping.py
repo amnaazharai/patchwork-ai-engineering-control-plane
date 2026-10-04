@@ -7,9 +7,9 @@ that, and the second attempt fixes it and gets approved.
 
 import json
 
-from patchwork.models.schemas import Task
+from patchwork.models.schemas import EngineeringTask
 
-TASK = Task(
+TASK = EngineeringTask(
     id="ADS-142",
     title="Add per-user frequency capping",
     description=(
@@ -28,30 +28,34 @@ TASK = Task(
 )
 
 PLAN = {
-    "summary": "Add a FrequencyCapper module, a frequency_cap field on Campaign, and an eligibility check in AdServer._candidates.",
+    "summary": (
+        "Add a FrequencyCapper module, a frequency_cap field on Campaign, "
+        "and an eligibility check in AdServer._candidates."
+    ),
     "steps": [
         {
-            "id": 1,
             "description": "Add optional frequency_cap to Campaign with validation",
             "files": ["src/ads_platform/models.py"],
+            "rationale": "Roadmap specifies an optional per-campaign cap; None means uncapped.",
         },
         {
-            "id": 2,
             "description": "Create FrequencyCapper tracking impressions per (campaign, user)",
             "files": ["src/ads_platform/frequency.py"],
+            "rationale": "Architecture doc asks for each eligibility rule in its own module.",
         },
         {
-            "id": 3,
             "description": "Skip capped campaigns in AdServer._candidates and record served impressions",
             "files": ["src/ads_platform/serving.py"],
+            "rationale": "Filtering before the auction lets the next best campaign win.",
         },
         {
-            "id": 4,
             "description": "Unit tests for the capper and the serving behaviour",
             "files": ["tests/test_frequency.py"],
+            "rationale": "Cover every acceptance criterion.",
         },
     ],
     "risks": ["Counting per user instead of per (campaign, user) would cap unrelated campaigns"],
+    "assumptions": ["Caps reset daily together with budgets; the reset job is out of scope"],
 }
 
 _MODELS_FIELD_OLD = "    active: bool = True\n\n    def __post_init__(self) -> None:\n"
@@ -205,7 +209,7 @@ def _build(frequency_source: str, summary: str):
         return json.dumps(
             {
                 "summary": summary,
-                "changes": [
+                "edits": [
                     {"path": "src/ads_platform/models.py", "content": models},
                     {"path": "src/ads_platform/frequency.py", "content": frequency_source},
                     {"path": "src/ads_platform/serving.py", "content": serving},
@@ -223,6 +227,7 @@ REVIEW = {
     "findings": [
         {
             "severity": "minor",
+            "category": "design",
             "message": "FrequencyCapper is never reset; a daily reset job will be needed alongside BudgetTracker.reset().",
             "path": "src/ads_platform/frequency.py",
         }

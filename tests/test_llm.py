@@ -1,32 +1,35 @@
+from types import SimpleNamespace as NS
+
 import pytest
+from pydantic import BaseModel, ValidationError
 
-from patchwork.llm import LLMError, ScriptedLLM, extract_json
-
-
-@pytest.mark.parametrize(
-    "text",
-    [
-        '{"a": 1}',
-        'Here you go:\n```json\n{"a": 1}\n```\nThanks',
-        'Sure! {"a": 1} hope that helps',
-    ],
-)
-def test_extract_json(text):
-    assert extract_json(text) == {"a": 1}
+from patchwork.interfaces import LLM
+from patchwork.llm import AnthropicLLM, LLMError, ScriptedLLM
 
 
-def test_extract_json_failure():
-    with pytest.raises(LLMError):
-        extract_json("no json here")
+class Out(BaseModel):
+    a: int
 
 
-def test_scripted_llm_replays_per_role_and_records_calls():
-    llm = ScriptedLLM({"a": ["one", lambda system, prompt: prompt.upper()]})
-    assert llm.complete("a", "sys", "x") == "one"
-    assert llm.complete("a", "sys", "hi") == "HI"
-    assert [c.response for c in llm.calls] == ["one", "HI"]
-    with pytest.raises(LLMError):
-        llm.complete("a", "sys", "again")
+def test_backends_satisfy_llm_protocol():
+    assert isinstance(ScriptedLLM({}), LLM)
+    assert isinstance(AnthropicLLM(client=object()), LLM)
+
+
+def test_scripted_llm_accepts_str_dict_model_and_callable():
+    llm = ScriptedLLM({"x": ['{"a": 1}', {"a": 2}, Out(a=3), lambda system, prompt: {"a": len(prompt)}]})
+    assert [llm.generate("x", "sys", "hi", Out).a for _ in range(4)] == [1, 2, 3, 2]
+    assert [c.schema for c in llm.calls] == ["Out"] * 4
+
+
+def test_scripted_llm_validates_against_schema():
+    with pytest.raises(ValidationError):
+        ScriptedLLM({"x": [{"a": "nope"}]}).generate("x", "s", "p", Out)
+
+
+def test_scripted_llm_runs_out():
+    with pytest.raises(LLMError, match="no response left"):
+        ScriptedLLM({}).generate("x", "s", "p", Out)
 
 
 class _FakeStream:
@@ -44,11 +47,9 @@ class _FakeStream:
 
 
 class _FakeClient:
-    def __init__(self, stop_reason, text="ok"):
-        from types import SimpleNamespace as NS
-
+    def __init__(self, stop_reason, parsed=None):
         self.kwargs = None
-        message = NS(stop_reason=stop_reason, content=[NS(type="thinking"), NS(type="text", text=text)])
+        message = NS(stop_reason=stop_reason, parsed_output=parsed, usage=NS(input_tokens=10, output_tokens=5))
 
         def stream(**kwargs):
             self.kwargs = kwargs
@@ -57,20 +58,19 @@ class _FakeClient:
         self.beta = NS(messages=NS(stream=stream))
 
 
-def test_anthropic_llm_request_shape_and_text():
-    from patchwork.llm import AnthropicLLM
-
-    client = _FakeClient("end_turn", '{"x": 1}')
+def test_anthropic_llm_uses_structured_outputs_and_records_usage():
+    client = _FakeClient("end_turn", Out(a=7))
     llm = AnthropicLLM(model="claude-opus-5-5", effort="high", client=client)
-    assert llm.complete("planner", "sys", "hello") == '{"x": 1}'
+    assert llm.generate("planner", "sys", "hello", Out) == Out(a=7)
+    assert client.kwargs["output_format"] is Out
     assert client.kwargs["model"] == "claude-opus-5-5"
     assert client.kwargs["output_config"] == {"effort": "high"}
     assert client.kwargs["fallbacks"] == "default"
+    call = llm.calls[0]
+    assert (call.role, call.schema, call.input_tokens, call.output_tokens) == ("planner", "Out", 10, 5)
 
 
-@pytest.mark.parametrize("stop_reason", ["refusal", "max_tokens"])
-def test_anthropic_llm_raises_on_unusable_stop(stop_reason):
-    from patchwork.llm import AnthropicLLM
-
+@pytest.mark.parametrize("stop_reason,parsed", [("refusal", None), ("max_tokens", None), ("end_turn", None)])
+def test_anthropic_llm_raises_on_unusable_response(stop_reason, parsed):
     with pytest.raises(LLMError):
-        AnthropicLLM(client=_FakeClient(stop_reason)).complete("planner", "sys", "hi")
+        AnthropicLLM(client=_FakeClient(stop_reason, parsed)).generate("planner", "s", "p", Out)

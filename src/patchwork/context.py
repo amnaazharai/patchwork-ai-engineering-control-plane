@@ -1,9 +1,10 @@
-"""Repository context: what the agents can see and where their edits land.
+"""Repository access, retrieval, and the isolated workspace.
 
-`RepoContext` is a read-only view of the target repository used to build
-prompts. `Workspace` is a disposable copy of that repository where patches are
-applied and tests are run, so the original checkout is never touched unless the
-caller explicitly exports the result.
+* `RepoContext` lists and reads files in a repository.
+* `KeywordRetriever` implements `interfaces.Retriever`: it ranks files against
+  a task and returns a budgeted `RetrievedContext` with provenance.
+* `Workspace` is a disposable copy of the repository where changes are applied
+  and tests run, so the original checkout is never touched.
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from patchwork.models.schemas import FileChange, Patch
+from patchwork.models.schemas import CodeChange, ContextSnippet, EngineeringTask, FileEdit, RetrievedContext, SourceKind
 
 DEFAULT_IGNORES = (
     ".git",
@@ -89,36 +90,81 @@ class RepoContext:
     def tree(self) -> str:
         return "\n".join(self.files())
 
-    def relevant_files(self, query: str, limit: int = 8) -> list[str]:
-        """Rank files by keyword overlap with `query` (path hits count double).
 
-        Cheap and deterministic; good enough to pick what goes in a prompt.
-        """
-        terms = {w.lower() for w in _WORD.findall(query)} - _STOPWORDS
-        scored = []
-        for rel in self.files():
-            text = (self.read(rel) or "").lower()
-            path_l = rel.lower()
-            score = sum(text.count(t) + 2 * path_l.count(t) for t in terms)
-            if score:
-                scored.append((score, rel))
+def classify(path: str) -> SourceKind:
+    name = path.rsplit("/", 1)[-1]
+    if path.startswith("tests/") or "/tests/" in path or name.startswith("test_") or name.endswith("_test.py"):
+        return SourceKind.TEST
+    if name.endswith((".md", ".txt")):
+        return SourceKind.DOC
+    if name.endswith((".toml", ".cfg", ".ini", ".json", ".yaml", ".yml")):
+        return SourceKind.CONFIG
+    return SourceKind.CODE
+
+
+@dataclass
+class KeywordRetriever:
+    """Lexical retrieval over whole files.
+
+    Scores each file by how often the task's terms appear in its content, with
+    path matches weighted higher, then fills a character budget in rank order.
+    Deterministic, dependency-free and explainable (each snippet carries the
+    terms that matched); the obvious upgrade path is chunking plus embeddings
+    behind the same `Retriever` interface.
+    """
+
+    repo: RepoContext
+    max_snippets: int = 8
+    budget_chars: int = 60_000
+    path_weight: int = 2
+    strategy: str = "keyword"
+
+    def retrieve(self, task: EngineeringTask) -> RetrievedContext:
+        terms = sorted({w.lower() for w in _WORD.findall(task.query)} - _STOPWORDS)
+        scored: list[tuple[float, str, str]] = []
+        for rel in self.repo.files():
+            text, path_l = (self.repo.read(rel) or "").lower(), rel.lower()
+            hits = {t: text.count(t) + self.path_weight * path_l.count(t) for t in terms}
+            hits = {t: n for t, n in hits.items() if n}
+            if hits:
+                top = sorted(hits.items(), key=lambda kv: (-kv[1], kv[0]))[:5]
+                reason = "matched " + ", ".join(f"{t}({n})" for t, n in top)
+                scored.append((float(sum(hits.values())), rel, reason))
         scored.sort(key=lambda s: (-s[0], s[1]))
-        return [rel for _, rel in scored[:limit]]
+        ranked = [(rel, score, reason) for score, rel, reason in scored[: self.max_snippets]]
+        return self._pack(task, ranked)
 
-    def render(self, paths: list[str], budget_chars: int = 60_000) -> str:
-        """Render files as fenced blocks for a prompt, stopping at the budget."""
-        parts, used = [], 0
-        for rel in paths:
-            body = self.read(rel)
-            if body is None:
+    def retrieve_files(self, task: EngineeringTask, paths: list[str]) -> RetrievedContext:
+        existing = [p for p in paths if self.repo.read(p) is not None]
+        return self._pack(task, [(p, 1.0, "requested by plan") for p in existing])
+
+    def _pack(self, task: EngineeringTask, ranked: list[tuple[str, float, str]]) -> RetrievedContext:
+        snippets, used, truncated = [], 0, False
+        for rel, score, reason in ranked:
+            content = self.repo.read(rel) or ""
+            if used + len(content) > self.budget_chars:
+                truncated = True
                 continue
-            block = f"### {rel}\n```\n{body}\n```\n"
-            if used + len(block) > budget_chars:
-                parts.append(f"### {rel}\n(omitted: context budget reached)\n")
-                continue
-            parts.append(block)
-            used += len(block)
-        return "\n".join(parts)
+            used += len(content)
+            snippets.append(
+                ContextSnippet(
+                    path=rel,
+                    kind=classify(rel),
+                    content=content,
+                    start_line=1,
+                    end_line=max(1, content.count("\n") + (not content.endswith("\n"))),
+                    score=score,
+                    reason=reason,
+                )
+            )
+        return RetrievedContext(
+            task_id=task.id,
+            query=task.query,
+            strategy=self.strategy,
+            snippets=snippets,
+            file_tree=self.repo.files(),
+            truncated=truncated,
+        )
 
 
 class PatchError(Exception):
@@ -144,42 +190,42 @@ class Workspace:
     def cleanup(self) -> None:
         self._tmp.cleanup()
 
-    def apply(self, patch: Patch, protected: list[str] | None = None) -> Patch:
-        """Apply `patch` atomically; return a copy with `original` filled in.
+    def apply(self, change: CodeChange, protected: list[str] | None = None) -> CodeChange:
+        """Apply `change` atomically; return a copy with `original` filled in.
 
-        Every change is validated before anything is written, so a rejected
-        patch leaves the workspace untouched.
+        Every edit is validated before anything is written, so a rejected
+        change leaves the workspace untouched.
         """
         protected = protected or []
         resolved = []
-        for change in patch.changes:
-            if any(fnmatch.fnmatch(change.path, pat) for pat in protected):
-                raise PatchError(f"refusing to modify protected path: {change.path}")
-            target = (self.root / change.path).resolve()
+        for edit in change.edits:
+            if any(fnmatch.fnmatch(edit.path, pat) for pat in protected):
+                raise PatchError(f"refusing to modify protected path: {edit.path}")
+            target = (self.root / edit.path).resolve()
             if self.root not in target.parents:
-                raise PatchError(f"path escapes workspace: {change.path}")
+                raise PatchError(f"path escapes workspace: {edit.path}")
             original = target.read_text() if target.is_file() else None
-            if change.content is None and original is None:
-                raise PatchError(f"cannot delete missing file: {change.path}")
-            resolved.append(FileChange(path=change.path, content=change.content, original=original))
+            if edit.content is None and original is None:
+                raise PatchError(f"cannot delete missing file: {edit.path}")
+            resolved.append(FileEdit(path=edit.path, content=edit.content, original=original))
 
-        for change in resolved:
-            target = self.root / change.path
-            if change.content is None:
+        for edit in resolved:
+            target = self.root / edit.path
+            if edit.content is None:
                 target.unlink()
             else:
                 target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(change.content)
+                target.write_text(edit.content)
         self.context._cache.clear()
-        return Patch(summary=patch.summary, changes=resolved)
+        return change.model_copy(update={"edits": resolved})
 
-    def revert(self, patch: Patch) -> None:
-        """Undo a patch previously returned by `apply`."""
-        for change in reversed(patch.changes):
-            target = self.root / change.path
-            if change.original is None:
+    def revert(self, change: CodeChange) -> None:
+        """Undo a change previously returned by `apply`."""
+        for edit in reversed(change.edits):
+            target = self.root / edit.path
+            if edit.original is None:
                 target.unlink(missing_ok=True)
             else:
                 target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(change.original)
+                target.write_text(edit.original)
         self.context._cache.clear()

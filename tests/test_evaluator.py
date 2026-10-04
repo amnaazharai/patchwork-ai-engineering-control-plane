@@ -1,56 +1,93 @@
-from patchwork.evaluation import Evaluator, summarize
+from patchwork.evaluation import RuleBasedEvaluator, summarize
+from patchwork.interfaces import Evaluator
 from patchwork.models.schemas import (
-    Evaluation,
-    FileChange,
-    Patch,
-    Review,
+    CodeChange,
+    EngineeringTask,
+    EvaluationResult,
+    FileEdit,
+    FindingCategory,
+    Recommendation,
+    ReviewFinding,
+    ReviewResult,
     RunResult,
     RunStatus,
-    Task,
-    TestResult,
+    Severity,
+    TestCase,
+    TestPlan,
+    TestRun,
 )
 
-PATCH = Patch(summary="s", changes=[FileChange(path="a.py", content="x\n", original="y\n")])
-GREEN = TestResult(command="pytest", exit_code=0, passed=10)
-APPROVED = Review(approved=True, summary="ok")
+TASK = EngineeringTask(id="t", title="t", description="d", acceptance_criteria=["a", "b"])
+CHANGE = CodeChange(task_id="t", summary="s", edits=[FileEdit(path="a.py", content="x\n", original="y\n")])
+GREEN = TestRun(command="pytest", exit_code=0, passed=10)
+APPROVED = ReviewResult(approved=True, summary="ok")
 
 
-def test_perfect_run_scores_one():
-    ev = Evaluator().evaluate(GREEN, APPROVED, PATCH, iterations=1, max_iterations=3)
-    assert ev.score == 1.0 and ev.passed
+def _eval(change=CHANGE, tests=GREEN, review=APPROVED, iterations=1, **kw):
+    return RuleBasedEvaluator().evaluate(TASK, change, tests, review, iterations=iterations, max_iterations=3, **kw)
 
 
-def test_failing_tests_gate_the_result():
-    red = TestResult(command="pytest", exit_code=1, passed=9, failed=1)
-    ev = Evaluator().evaluate(red, None, PATCH, iterations=3, max_iterations=3)
-    assert not ev.passed
-    assert any("gate failed" in n for n in ev.notes)
+def test_satisfies_protocol():
+    assert isinstance(RuleBasedEvaluator(), Evaluator)
 
 
-def test_regression_against_baseline_zeroes_tests_metric():
-    baseline = TestResult(command="pytest", exit_code=0, passed=12)
-    ev = Evaluator().evaluate(GREEN, APPROVED, PATCH, iterations=1, max_iterations=3, baseline=baseline)
-    assert ev.metrics["tests"] == 0.0
-    assert any("regression" in n for n in ev.notes)
+def test_clean_run_is_ready_for_human_review():
+    ev = _eval()
+    assert ev.score == 1.0 and ev.recommendation == Recommendation.READY_FOR_HUMAN_REVIEW
+    assert all(ev.gates.values())
+
+
+def test_failing_tests_need_revision():
+    red = TestRun(command="pytest", exit_code=1, passed=9, failed=1)
+    ev = _eval(tests=red, review=None, iterations=3)
+    assert ev.recommendation == Recommendation.NEEDS_REVISION
+    assert {"tests_pass", "review_approved"} <= set(ev.failed_gates)
+
+
+def test_blocker_finding_blocks():
+    review = ReviewResult(
+        approved=False,
+        summary="no",
+        findings=[ReviewFinding(severity=Severity.BLOCKER, category=FindingCategory.SECURITY, message="secret")],
+    )
+    assert _eval(review=review).recommendation == Recommendation.BLOCKED
+
+
+def test_no_change_blocks():
+    assert _eval(change=None, tests=None, review=None).recommendation == Recommendation.BLOCKED
+
+
+def test_regression_against_baseline():
+    ev = _eval(baseline=TestRun(command="pytest", exit_code=0, passed=12))
+    assert ev.metrics["test_pass_rate"] == 0.0 and not ev.gates["no_regression"]
+    assert ev.recommendation == Recommendation.NEEDS_REVISION
+    assert any("regression" in r for r in ev.reasons)
+
+
+def test_low_score_needs_revision_even_if_gates_pass():
+    big = CodeChange(task_id="t", summary="s", edits=[FileEdit(path="a.py", content="x\n" * 5000)])
+    ev = RuleBasedEvaluator(ready_threshold=0.95).evaluate(TASK, big, GREEN, APPROVED, iterations=3, max_iterations=3)
+    assert all(ev.gates.values()) and ev.recommendation == Recommendation.NEEDS_REVISION
+    assert any("below threshold" in r for r in ev.reasons)
+
+
+def test_uncovered_criteria_fail_gate_when_test_plan_given():
+    plan = TestPlan(task_id="t", cases=[TestCase(name="x", description="", criteria=[0])])
+    ev = _eval(test_plan=plan)
+    assert ev.metrics["criteria_coverage"] == 0.5 and not ev.gates["criteria_covered"]
+    assert any("'b'" in r for r in ev.reasons)
 
 
 def test_more_iterations_score_lower():
-    one = Evaluator().evaluate(GREEN, APPROVED, PATCH, iterations=1, max_iterations=3)
-    three = Evaluator().evaluate(GREEN, APPROVED, PATCH, iterations=3, max_iterations=3)
-    assert three.score < one.score
-
-
-def test_large_patches_score_lower():
-    big = Patch(summary="s", changes=[FileChange(path="a.py", content="x\n" * 1000)])
-    ev = Evaluator(target_lines=100).evaluate(GREEN, APPROVED, big, iterations=1, max_iterations=3)
-    assert ev.metrics["patch_size"] == 0.1
+    assert _eval(iterations=3).score < _eval(iterations=1).score
 
 
 def test_summarize():
-    task = Task(id="t", title="t", description="d")
+    ready = EvaluationResult(score=1.0, recommendation=Recommendation.READY_FOR_HUMAN_REVIEW)
+    not_ready = EvaluationResult(score=0.4, recommendation=Recommendation.NEEDS_REVISION)
     results = [
-        RunResult(task=task, status=RunStatus.SUCCEEDED, iterations=1, evaluation=Evaluation(score=1.0, passed=True)),
-        RunResult(task=task, status=RunStatus.FAILED, iterations=3, evaluation=Evaluation(score=0.4, passed=False)),
+        RunResult(task=TASK, status=RunStatus.AWAITING_HUMAN_REVIEW, iterations=1, evaluation=ready),
+        RunResult(task=TASK, status=RunStatus.FAILED, iterations=3, evaluation=not_ready),
     ]
     report = summarize(results)
-    assert report.success_rate == 0.5 and report.mean_score == 0.7 and report.mean_iterations == 2
+    assert report.ready_rate == 0.5 and report.mean_score == 0.7 and report.mean_iterations == 2

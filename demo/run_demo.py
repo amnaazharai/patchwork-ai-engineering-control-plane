@@ -22,7 +22,8 @@ from patchwork.models.schemas import Event  # noqa: E402
 
 
 def show(event: Event) -> None:
-    print(f"  [{event.stage:>8} #{event.iteration}] {event.message}")
+    took = f" ({event.duration_ms:.0f} ms)" if event.duration_ms is not None else ""
+    print(f"  [{event.stage:>8} #{event.iteration}] {event.message}{took}")
     for item in event.data.get("failing", []) or []:
         print(f"{'':>17}x {item}")
     for item in event.data.get("findings", []) or []:
@@ -42,16 +43,18 @@ def main() -> int:
 
     out = ROOT / "demo" / "output"
     out.mkdir(exist_ok=True)
-    if result.patch:
-        (out / f"{task.id}.diff").write_text(result.patch.diff())
+    if result.change:
+        (out / f"{task.id}.diff").write_text(result.change.diff())
     (out / f"{task.id}.json").write_text(result.model_dump_json(indent=2))
 
     ev = result.evaluation
-    print(f"\nstatus={result.status.value} iterations={result.iterations}")
+    print(f"\nrun {result.run_id}: status={result.status.value} iterations={result.iterations}")
     if ev:
-        print(f"score={ev.score:.3f} passed={ev.passed} metrics={ev.metrics}")
+        print(f"recommendation={ev.recommendation.value} score={ev.score:.3f}")
+        print(f"gates={ev.gates}")
+        print(f"metrics={ev.metrics}")
     print(f"artifacts: {out.relative_to(ROOT)}/{task.id}.diff, {task.id}.json")
-    return 0 if result.status.value == "succeeded" else 1
+    return 0 if result.status.value == "awaiting_human_review" else 1
 
 
 if __name__ == "__main__":

@@ -1,3 +1,3 @@
-from patchwork.evaluation.evaluator import Evaluator, SuiteReport, summarize
+from patchwork.evaluation.evaluator import RuleBasedEvaluator, SuiteReport, summarize
 
-__all__ = ["Evaluator", "SuiteReport", "summarize"]
+__all__ = ["RuleBasedEvaluator", "SuiteReport", "summarize"]
